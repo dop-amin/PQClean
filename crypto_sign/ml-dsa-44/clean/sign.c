@@ -66,12 +66,46 @@ int PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(uint8_t *pk, uint8_t *sk) {
     return 0;
 }
 
+int PQCLEAN_MLDSA44_CLEAN_crypto_sign_signature_ctx(
+        uint8_t *sig,
+        size_t *siglen,
+        const uint8_t *m,
+        size_t mlen,
+        const uint8_t *ctx,
+        size_t ctxlen,
+        const uint8_t *sk) {
+    return PQCLEAN_MLDSA44_CLEAN_crypto_sign_signature_ctx_trace(
+               NULL, sig, siglen, m, mlen, ctx, ctxlen, sk);
+}
+
 /*************************************************
-* Name:        crypto_sign_signature
+* Name:        polyvecl_to_array
 *
-* Description: Computes signature.
+* Description: Copy polyvecl to flat array for tracing
+**************************************************/
+static void polyvecl_to_array(int32_t *out, const polyvecl *v) {
+    unsigned int i, j;
+    for (i = 0; i < L; i++) {
+        for (j = 0; j < N; j++) {
+            out[i * N + j] = v->vec[i].coeffs[j];
+        }
+    }
+}
+
+static void poly_to_array(int32_t *out, const poly *p) {
+    unsigned int i;
+    for (i = 0; i < N; i++) {
+        out[i] = p->coeffs[i];
+    }
+}
+
+/*************************************************
+* Name:        crypto_sign_signature_ctx_trace
 *
-* Arguments:   - uint8_t *sig:   pointer to output signature (of length PQCLEAN_MLDSA44_CLEAN_CRYPTO_BYTES)
+* Description: Computes signature with optional tracing.
+*
+* Arguments:   - trace: pointer to trace structure (pass NULL to disable tracing)
+*              - uint8_t *sig:   pointer to output signature (of length PQCLEAN_MLDSA44_CLEAN_CRYPTO_BYTES)
 *              - size_t *siglen: pointer to output length of signature
 *              - uint8_t *m:     pointer to message to be signed
 *              - size_t mlen:    length of message
@@ -81,7 +115,9 @@ int PQCLEAN_MLDSA44_CLEAN_crypto_sign_keypair(uint8_t *pk, uint8_t *sk) {
 *
 * Returns 0 (success) or -1 (context string too long)
 **************************************************/
-int PQCLEAN_MLDSA44_CLEAN_crypto_sign_signature_ctx(uint8_t *sig,
+int PQCLEAN_MLDSA44_CLEAN_crypto_sign_signature_ctx_trace(
+        PQCLEAN_MLDSA44_CLEAN_trace_t *trace,
+        uint8_t *sig,
         size_t *siglen,
         const uint8_t *m,
         size_t mlen,
@@ -92,10 +128,17 @@ int PQCLEAN_MLDSA44_CLEAN_crypto_sign_signature_ctx(uint8_t *sig,
     uint8_t seedbuf[2 * SEEDBYTES + TRBYTES + RNDBYTES + 2 * CRHBYTES];
     uint8_t *rho, *tr, *key, *mu, *rhoprime, *rnd;
     uint16_t nonce = 0;
-    polyvecl mat[K], s1, y, z;
+    polyvecl mat[K], s1, y, z, z_cs1;
     polyveck t0, s2, w1, w0, h;
     poly cp;
     shake256incctx state;
+    int rejection_count = 0;
+
+    /* Initialize trace if provided */
+    if (trace) {
+        trace->rejection_count = 0;
+        trace->success = 0;
+    }
 
     if (ctxlen > 255) {
         return -1;
@@ -126,7 +169,23 @@ int PQCLEAN_MLDSA44_CLEAN_crypto_sign_signature_ctx(uint8_t *sig,
 
     /* Expand matrix and transform vectors */
     PQCLEAN_MLDSA44_CLEAN_polyvec_matrix_expand(mat, rho);
+
+    /* TRACE: Capture s1 before NTT */
+    if (trace) {
+        polyvecl_to_array(trace->s1, &s1);
+    }
+
     PQCLEAN_MLDSA44_CLEAN_polyvecl_ntt(&s1);
+
+    // Note: Additional reduction, not present in original code
+    // Reason: Speed up attack by limiting #hypotheses
+    PQCLEAN_MLDSA44_CLEAN_polyvecl_reduce(&s1);
+
+    /* TRACE: Capture s1 in NTT domain */
+    if (trace) {
+        polyvecl_to_array(trace->s1_ntt, &s1);
+    }
+
     PQCLEAN_MLDSA44_CLEAN_polyveck_ntt(&s2);
     PQCLEAN_MLDSA44_CLEAN_polyveck_ntt(&t0);
 
@@ -134,9 +193,20 @@ rej:
     /* Sample intermediate vector y */
     PQCLEAN_MLDSA44_CLEAN_polyvecl_uniform_gamma1(&y, rhoprime, nonce++);
 
+    /* TRACE: Capture y before NTT */
+    if (trace) {
+        polyvecl_to_array(trace->y, &y);
+    }
+
     /* Matrix-vector multiplication */
     z = y;
     PQCLEAN_MLDSA44_CLEAN_polyvecl_ntt(&z);
+
+    /* TRACE: Capture y in NTT domain */
+    if (trace) {
+        polyvecl_to_array(trace->y_ntt, &z);
+    }
+
     PQCLEAN_MLDSA44_CLEAN_polyvec_matrix_pointwise_montgomery(&w1, mat, &z);
     PQCLEAN_MLDSA44_CLEAN_polyveck_reduce(&w1);
     PQCLEAN_MLDSA44_CLEAN_polyveck_invntt_tomont(&w1);
@@ -152,15 +222,48 @@ rej:
     shake256_inc_finalize(&state);
     shake256_inc_squeeze(sig, CTILDEBYTES, &state);
     shake256_inc_ctx_release(&state);
+
+    /* TRACE: Capture challenge */
+    if (trace) {
+        for (n = 0; n < CTILDEBYTES; n++) {
+            trace->challenge[n] = sig[n];
+        }
+    }
+
     PQCLEAN_MLDSA44_CLEAN_poly_challenge(&cp, sig);
     PQCLEAN_MLDSA44_CLEAN_poly_ntt(&cp);
 
+    /* TRACE: Capture challenge in NTT domain */
+    if (trace) {
+        poly_to_array(trace->c_ntt, &cp);
+    }
+
     /* Compute z, reject if it reveals secret */
     PQCLEAN_MLDSA44_CLEAN_polyvecl_pointwise_poly_montgomery(&z, &cp, &s1);
+
+    /* TRACE: Capture c*s1 in NTT domain */
+    if (trace) {
+        polyvecl_to_array(trace->cs1_ntt, &z);
+    }
+
+    /* TRACE: Capture c*s1 in normal domain */
+    if (trace) {
+        z_cs1 = z;
+        PQCLEAN_MLDSA44_CLEAN_polyvecl_invntt_tomont(&z_cs1);
+        polyvecl_to_array(trace->cs1, &z_cs1);
+    }
+
     PQCLEAN_MLDSA44_CLEAN_polyvecl_invntt_tomont(&z);
     PQCLEAN_MLDSA44_CLEAN_polyvecl_add(&z, &z, &y);
     PQCLEAN_MLDSA44_CLEAN_polyvecl_reduce(&z);
+
+    /* TRACE: Capture z = y + c*s1 */
+    if (trace) {
+        polyvecl_to_array(trace->z, &z);
+    }
+
     if (PQCLEAN_MLDSA44_CLEAN_polyvecl_chknorm(&z, GAMMA1 - BETA)) {
+        rejection_count++;
         goto rej;
     }
 
@@ -171,6 +274,7 @@ rej:
     PQCLEAN_MLDSA44_CLEAN_polyveck_sub(&w0, &w0, &h);
     PQCLEAN_MLDSA44_CLEAN_polyveck_reduce(&w0);
     if (PQCLEAN_MLDSA44_CLEAN_polyveck_chknorm(&w0, GAMMA2 - BETA)) {
+        rejection_count++;
         goto rej;
     }
 
@@ -179,18 +283,27 @@ rej:
     PQCLEAN_MLDSA44_CLEAN_polyveck_invntt_tomont(&h);
     PQCLEAN_MLDSA44_CLEAN_polyveck_reduce(&h);
     if (PQCLEAN_MLDSA44_CLEAN_polyveck_chknorm(&h, GAMMA2)) {
+        rejection_count++;
         goto rej;
     }
 
     PQCLEAN_MLDSA44_CLEAN_polyveck_add(&w0, &w0, &h);
     n = PQCLEAN_MLDSA44_CLEAN_polyveck_make_hint(&h, &w0, &w1);
     if (n > OMEGA) {
+        rejection_count++;
         goto rej;
     }
 
     /* Write signature */
     PQCLEAN_MLDSA44_CLEAN_pack_sig(sig, sig, &z, &h);
     *siglen = PQCLEAN_MLDSA44_CLEAN_CRYPTO_BYTES;
+
+    /* TRACE: Mark success */
+    if (trace) {
+        trace->rejection_count = rejection_count;
+        trace->success = 1;
+    }
+
     return 0;
 }
 
